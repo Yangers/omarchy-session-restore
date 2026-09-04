@@ -13,6 +13,7 @@ import time
 import subprocess
 import argparse
 import shutil
+import threading
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "omarchy" / "session"
@@ -23,7 +24,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_CONFIG = {
     "enabled": True,
     "auto_restore": False,
-    "clean_delay_sec": 7,
+    "clean_delay_sec": 10,
     "ignored_classes": [
         "quickshell",
         "org.quickshell",
@@ -97,10 +98,6 @@ def get_process_cwd(pid):
     return str(Path.home())
 
 def get_terminal_cwd_and_cmd(pid):
-    """
-    Finds the active shell or child process inside a terminal window to extract
-    the current working directory and check if herdr or another interactive app is running.
-    """
     best_cwd = str(Path.home())
     is_herdr = False
     
@@ -125,7 +122,6 @@ def get_terminal_cwd_and_cmd(pid):
     except Exception:
         pass
 
-    # If still default or root, fallback to process cwd if not root
     if best_cwd == str(Path.home()):
         proc_cwd = get_process_cwd(pid)
         if proc_cwd and proc_cwd != "/":
@@ -149,7 +145,7 @@ def save_session():
     ignored = set(cfg.get("ignored_classes", []))
     saved_windows = []
     has_chromium = False
-    chromium_bin = "/usr/bin/chromium"
+    chromium_bin = shutil.which("chromium") or shutil.which("google-chrome-stable") or "/usr/bin/chromium"
 
     for c in clients:
         ws = c.get("workspace", {})
@@ -183,7 +179,6 @@ def save_session():
         ):
             app_type = "chromium"
             has_chromium = True
-            chromium_bin = shutil.which("chromium") or shutil.which("google-chrome-stable") or exe or "chromium"
             is_pwa = w_class.startswith("chrome-")
             meta = {
                 "is_pwa": is_pwa,
@@ -222,6 +217,7 @@ def save_session():
             "workspace_id": ws_id,
             "workspace_name": ws.get("name", str(ws_id)),
             "class": w_class,
+            "initial_class": c.get("initialClass", w_class),
             "title": title,
             "pid": pid,
             "app_type": app_type,
@@ -230,13 +226,31 @@ def save_session():
             "floating": c.get("floating", False)
         })
 
+    # Capture active Herdr agents if herdr is installed
+    herdr_agents = []
+    if shutil.which("herdr"):
+        try:
+            agent_raw = run_cmd(["herdr", "agent", "list"])
+            if agent_raw:
+                data = json.loads(agent_raw)
+                for a in data.get("result", {}).get("agents", []):
+                    herdr_agents.append({
+                        "agent": a.get("agent"),
+                        "pane_id": a.get("pane_id"),
+                        "cwd": a.get("cwd", str(Path.home())),
+                        "tab_id": a.get("tab_id")
+                    })
+        except Exception:
+            pass
+
     session_data = {
         "timestamp": time.time(),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "has_chromium": has_chromium,
         "chromium_bin": chromium_bin,
         "window_count": len(saved_windows),
-        "windows": saved_windows
+        "windows": saved_windows,
+        "herdr_agents": herdr_agents
     }
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,8 +258,69 @@ def save_session():
         json.dump(session_data, f, indent=2)
 
     distinct_ws = len(set(w["workspace_id"] for w in saved_windows))
-    print(f"[omarchy-session] Saved {len(saved_windows)} window(s) across {distinct_ws} workspace(s).")
+    print(f"[omarchy-session] Saved {len(saved_windows)} window(s) across {distinct_ws} workspace(s), {len(herdr_agents)} Herdr agent(s).")
     return True
+
+def reconcile_windows(expected_windows, max_duration=10.0, poll_interval=0.3):
+    """
+    Active reconciliation: monitors hyprctl clients as apps launch and immediately moves
+    any window that landed on the wrong workspace to its intended workspace.
+    """
+    start_time = time.time()
+    targets = []
+    for w in expected_windows:
+        targets.append({
+            "target_ws": w["workspace_id"],
+            "class": w.get("class", "").lower(),
+            "initial_class": w.get("initial_class", "").lower(),
+            "title": w.get("title", "").lower(),
+            "app_type": w.get("app_type", "generic")
+        })
+
+    moved_addresses = set()
+
+    while time.time() - start_time < max_duration:
+        try:
+            raw = run_cmd(["hyprctl", "clients", "-j"])
+            if not raw:
+                time.sleep(poll_interval)
+                continue
+            current_clients = json.loads(raw)
+        except Exception:
+            time.sleep(poll_interval)
+            continue
+
+        for c in current_clients:
+            addr = c.get("address")
+            if not addr or addr in moved_addresses:
+                continue
+
+            current_ws = c.get("workspace", {}).get("id")
+            c_class = c.get("class", "").lower()
+            c_init_class = c.get("initialClass", "").lower()
+            c_title = c.get("title", "").lower()
+
+            for t in targets:
+                target_ws = t["target_ws"]
+                matched = False
+
+                if t["class"] and (t["class"] == c_class or t["class"] == c_init_class):
+                    matched = True
+                elif t["app_type"] == "chromium" and t["title"] and len(t["title"]) > 3:
+                    # Match key titles like Gmail, BBC, etc.
+                    key_part = t["title"][:20]
+                    if key_part in c_title:
+                        matched = True
+
+                if matched:
+                    if current_ws != target_ws:
+                        move_cmd = f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{target_ws}", follow = false }})'
+                        run_cmd(["hyprctl", "dispatch", move_cmd])
+                        print(f"[omarchy-session] Reconciled {c.get('class')} -> Workspace {target_ws}")
+                    moved_addresses.add(addr)
+                    break
+
+        time.sleep(poll_interval)
 
 def restore_session():
     if not SESSION_FILE.exists():
@@ -273,6 +348,7 @@ def restore_session():
     vscode_windows = [w for w in windows if w["app_type"] == "vscode"]
     generic_windows = [w for w in windows if w["app_type"] == "generic"]
 
+    # Initial Hyprland window rules
     for cw in chromium_windows:
         ws_id = cw["workspace_id"]
         c_class = cw["class"]
@@ -284,6 +360,7 @@ def restore_session():
         c_class = gw["class"]
         hyprctl_eval(f'o.window("{c_class}", {{ workspace = "{ws_id} silent" }})')
 
+    # Launch Chromium
     if session.get("has_chromium", False):
         chrom_bin = shutil.which("chromium") or shutil.which("google-chrome-stable") or session.get("chromium_bin") or "chromium"
         print(f"[omarchy-session] Launching {chrom_bin} with --restore-last-session...")
@@ -294,6 +371,7 @@ def restore_session():
             start_new_session=True
         )
 
+    # Launch Terminals
     term_idx = 0
     for tw in terminal_windows:
         term_idx += 1
@@ -336,6 +414,7 @@ def restore_session():
         )
         time.sleep(0.15)
 
+    # Launch VS Code
     for vw in vscode_windows:
         ws_id = vw["workspace_id"]
         meta = vw.get("meta", {})
@@ -351,6 +430,7 @@ def restore_session():
             start_new_session=True
         )
 
+    # Launch Generic Apps (Telegram, etc.)
     for gw in generic_windows:
         meta = gw.get("meta", {})
         exe = meta.get("exe")
@@ -364,9 +444,26 @@ def restore_session():
             )
             time.sleep(0.1)
 
-    delay = cfg.get("clean_delay_sec", 7)
-    cleanup_cmd = f"sleep {delay} && hyprctl reload"
-    subprocess.Popen(["bash", "-c", cleanup_cmd], start_new_session=True)
+    # Active Reconciliation Loop: ensures every window lands on its correct workspace
+    print("[omarchy-session] Reconciling window positions across workspaces...")
+    reconcile_windows(windows, max_duration=10.0, poll_interval=0.3)
+
+    # Relaunch Herdr agents if saved
+    saved_herdr_agents = session.get("herdr_agents", [])
+    if saved_herdr_agents and shutil.which("herdr"):
+        def resume_herdr_agents():
+            time.sleep(3.0) # Wait for Herdr to finish connecting
+            for ha in saved_herdr_agents:
+                p_id = ha.get("pane_id")
+                agent_name = ha.get("agent")
+                if p_id and agent_name:
+                    print(f"[omarchy-session] Resuming agent {agent_name} in Herdr pane {p_id}...")
+                    run_cmd(["herdr", "pane", "run", p_id, agent_name])
+
+        threading.Thread(target=resume_herdr_agents, daemon=True).start()
+
+    # Reset dynamic rules
+    hyprctl_eval("hl.reload()")
 
     try:
         SESSION_FILE.replace(BACKUP_FILE)
@@ -374,12 +471,13 @@ def restore_session():
         pass
 
     distinct_ws = len(set(w["workspace_id"] for w in windows))
+    agent_msg = f", {len(saved_herdr_agents)} agent(s)" if saved_herdr_agents else ""
     run_cmd([
         "notify-send",
         "-a", "Omarchy Session",
         "-i", "document-revert",
         "Session Restored",
-        f"Reopened {len(windows)} app(s) across {distinct_ws} workspace(s)."
+        f"Reopened {len(windows)} app(s){agent_msg} across {distinct_ws} workspace(s)."
     ])
     return True
 
@@ -405,9 +503,11 @@ def prompt_user():
     win_count = session.get("window_count", 0)
     windows = session.get("windows", [])
     distinct_ws = len(set(w["workspace_id"] for w in windows))
+    herdr_count = len(session.get("herdr_agents", []))
+    subtext_extra = f", {herdr_count} agent(s)" if herdr_count > 0 else ""
 
     prompt_text = "Restore Previous Session?"
-    opt_restore = f"✨\tReopen Windows & Workspaces\tRestore {win_count} apps across {distinct_ws} workspaces"
+    opt_restore = f"✨\tReopen Windows & Workspaces\tRestore {win_count} apps{subtext_extra} across {distinct_ws} workspaces"
     opt_fresh = "❌\tStart Fresh\tDiscard saved session"
     opt_always = "⚙️\tAlways Reopen at Boot\tRestore automatically on startup"
     opt_disable = "🚫\tDisable Session Restore\tTurn off session saving"
@@ -464,6 +564,11 @@ def status_session():
                 data = json.load(f)
             print(f"Saved At: {data.get('created_at')}")
             print(f"Window Count: {data.get('window_count')}")
+            agents = data.get("herdr_agents", [])
+            if agents:
+                print(f"Herdr Agents: {len(agents)}")
+                for a in agents:
+                    print(f"  🤖 Agent: {a.get('agent')} (pane: {a.get('pane_id')})")
             windows = data.get("windows", [])
             for w in windows:
                 print(f"  • [WS {w['workspace_id']}] {w['class']} ({w['app_type']}) - {w['title'][:40]}")

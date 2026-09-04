@@ -12,6 +12,7 @@ import json
 import time
 import subprocess
 import argparse
+import shutil
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "omarchy" / "session"
@@ -182,8 +183,7 @@ def save_session():
         ):
             app_type = "chromium"
             has_chromium = True
-            if exe and "chromium" in exe:
-                chromium_bin = exe
+            chromium_bin = shutil.which("chromium") or shutil.which("google-chrome-stable") or exe or "chromium"
             is_pwa = w_class.startswith("chrome-")
             meta = {
                 "is_pwa": is_pwa,
@@ -276,18 +276,16 @@ def restore_session():
     for cw in chromium_windows:
         ws_id = cw["workspace_id"]
         c_class = cw["class"]
-        safe_class = c_class.replace(".", "\\.").replace("-", "\\-")
-        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{safe_class}$" }}, workspace = "{ws_id} silent" }})')
+        hyprctl_eval(f'o.window("{c_class}", {{ workspace = "{ws_id} silent" }})')
 
     launched_execs = set()
     for gw in generic_windows:
         ws_id = gw["workspace_id"]
         c_class = gw["class"]
-        safe_class = c_class.replace(".", "\\.").replace("-", "\\-")
-        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{safe_class}$" }}, workspace = "{ws_id} silent" }})')
+        hyprctl_eval(f'o.window("{c_class}", {{ workspace = "{ws_id} silent" }})')
 
     if session.get("has_chromium", False):
-        chrom_bin = session.get("chromium_bin") or "chromium"
+        chrom_bin = shutil.which("chromium") or shutil.which("google-chrome-stable") or session.get("chromium_bin") or "chromium"
         print(f"[omarchy-session] Launching {chrom_bin} with --restore-last-session...")
         subprocess.Popen(
             [chrom_bin, "--restore-last-session"],
@@ -306,7 +304,7 @@ def restore_session():
         term_class = meta.get("terminal_class", "foot")
 
         custom_app_id = f"term_restore_{ws_id}_{term_idx}"
-        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{custom_app_id}$" }}, workspace = "{ws_id} silent" }})')
+        hyprctl_eval(f'o.window("{custom_app_id}", {{ workspace = "{ws_id} silent" }})')
 
         launch_args = []
         if "foot" in term_class:
@@ -342,7 +340,7 @@ def restore_session():
         ws_id = vw["workspace_id"]
         meta = vw.get("meta", {})
         opened_dir = meta.get("opened_dir")
-        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^[cC]ode$" }}, workspace = "{ws_id} silent" }})')
+        hyprctl_eval(f'o.window("^[cC]ode$", {{ workspace = "{ws_id} silent" }})')
         args = ["code"]
         if opened_dir:
             args.append(opened_dir)
@@ -409,14 +407,14 @@ def prompt_user():
     distinct_ws = len(set(w["workspace_id"] for w in windows))
 
     prompt_text = "Restore Previous Session?"
-    opt_restore = f"✨ Reopen Windows & Workspaces\t{win_count} apps across {distinct_ws} workspace(s)"
-    opt_fresh = "❌ Start Fresh\tDiscard saved session"
-    opt_always = "⚙️ Always Reopen at Boot\tRestore automatically without asking"
-    opt_disable = "🚫 Disable Session Restore\tTurn off session saving and prompt"
+    opt_restore = f"✨\tReopen Windows & Workspaces\tRestore {win_count} apps across {distinct_ws} workspaces"
+    opt_fresh = "❌\tStart Fresh\tDiscard saved session"
+    opt_always = "⚙️\tAlways Reopen at Boot\tRestore automatically on startup"
+    opt_disable = "🚫\tDisable Session Restore\tTurn off session saving"
 
     try:
         res = subprocess.run(
-            ["omarchy", "menu", "select", prompt_text, opt_restore, opt_fresh, opt_always, opt_disable],
+            ["omarchy", "menu", "select", prompt_text, opt_restore, opt_fresh, opt_always, opt_disable, "--", "--width", "520"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True

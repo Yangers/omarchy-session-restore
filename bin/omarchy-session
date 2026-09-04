@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+omarchy-session: macOS-style session save & restore for Omarchy (Hyprland + Wayland).
+
+Saves active windows, workspaces, working directories, and browser states before shutdown,
+and offers an interactive prompt at boot to reopen everything seamlessly.
+"""
+
+import sys
+import os
+import json
+import time
+import subprocess
+import argparse
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "omarchy" / "session"
+SESSION_FILE = CONFIG_DIR / "last-session.json"
+BACKUP_FILE = CONFIG_DIR / "last-session.json.bak"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "auto_restore": False,
+    "clean_delay_sec": 7,
+    "ignored_classes": [
+        "quickshell",
+        "org.quickshell",
+        "hyprland-share-picker",
+        "omarchy-osd",
+        "xwaylandvideobridge",
+        "looking-glass-client",
+        "rofi",
+        "walker",
+        "tofi",
+        "wofi",
+        "zenity",
+        "yad"
+    ]
+}
+
+def load_config():
+    if not CONFIG_DIR.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG)
+        return DEFAULT_CONFIG.copy()
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            merged = DEFAULT_CONFIG.copy()
+            merged.update(cfg)
+            return merged
+    except Exception as e:
+        print(f"[omarchy-session] Warning: Failed to read config: {e}", file=sys.stderr)
+        return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[omarchy-session] Error saving config: {e}", file=sys.stderr)
+
+def run_cmd(cmd, check=False):
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+        return res.stdout.strip()
+    except Exception as e:
+        if check:
+            raise
+        return ""
+
+def hyprctl_eval(lua_code):
+    try:
+        subprocess.run(["hyprctl", "eval", lua_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception as e:
+        print(f"[omarchy-session] hyprctl eval failed for: {lua_code}\nError: {e}", file=sys.stderr)
+
+def get_process_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+        return [a.decode("utf-8", errors="replace") for a in raw.split(b"\x00") if a]
+    except Exception:
+        return []
+
+def get_process_cwd(pid):
+    try:
+        cwd = os.path.realpath(f"/proc/{pid}/cwd")
+        if os.path.isdir(cwd):
+            return cwd
+    except Exception:
+        pass
+    return str(Path.home())
+
+def get_terminal_cwd_and_cmd(pid):
+    """
+    Finds the active shell or child process inside a terminal window to extract
+    the current working directory and check if herdr or another interactive app is running.
+    """
+    best_cwd = str(Path.home())
+    is_herdr = False
+    
+    try:
+        children_out = run_cmd(["pgrep", "-P", str(pid)])
+        child_pids = [int(p) for p in children_out.split() if p.isdigit()]
+        for cpid in child_pids:
+            cmdline = get_process_cmdline(cpid)
+            cmd_str = " ".join(cmdline).lower()
+            if "herdr" in cmd_str:
+                is_herdr = True
+            
+            grand_out = run_cmd(["pgrep", "-P", str(cpid)])
+            for gpid in [int(p) for p in grand_out.split() if p.isdigit()]:
+                g_cmdline = get_process_cmdline(gpid)
+                if "herdr" in " ".join(g_cmdline).lower():
+                    is_herdr = True
+            
+            c_cwd = get_process_cwd(cpid)
+            if c_cwd and c_cwd != "/":
+                best_cwd = c_cwd
+    except Exception:
+        pass
+
+    # If still default or root, fallback to process cwd if not root
+    if best_cwd == str(Path.home()):
+        proc_cwd = get_process_cwd(pid)
+        if proc_cwd and proc_cwd != "/":
+            best_cwd = proc_cwd
+
+    return best_cwd, is_herdr
+
+def save_session():
+    cfg = load_config()
+    if not cfg.get("enabled", True):
+        print("[omarchy-session] Feature is disabled in config.", file=sys.stderr)
+        return False
+
+    try:
+        clients_json = run_cmd(["hyprctl", "clients", "-j"], check=True)
+        clients = json.loads(clients_json)
+    except Exception as e:
+        print(f"[omarchy-session] Failed to query hyprctl clients: {e}", file=sys.stderr)
+        return False
+
+    ignored = set(cfg.get("ignored_classes", []))
+    saved_windows = []
+    has_chromium = False
+    chromium_bin = "/usr/bin/chromium"
+
+    for c in clients:
+        ws = c.get("workspace", {})
+        ws_id = ws.get("id", -1)
+        if ws_id < 1:
+            continue
+
+        w_class = c.get("class", "").strip()
+        title = c.get("title", "").strip()
+        pid = c.get("pid", 0)
+
+        if not w_class or w_class in ignored:
+            continue
+
+        exe = ""
+        if pid and os.path.exists(f"/proc/{pid}/exe"):
+            try:
+                exe = os.path.realpath(f"/proc/{pid}/exe")
+            except Exception:
+                exe = ""
+
+        app_type = "generic"
+        meta = {}
+
+        w_class_lower = w_class.lower()
+        if (
+            "chromium" in w_class_lower
+            or "google-chrome" in w_class_lower
+            or "brave" in w_class_lower
+            or w_class.startswith("chrome-")
+        ):
+            app_type = "chromium"
+            has_chromium = True
+            if exe and "chromium" in exe:
+                chromium_bin = exe
+            is_pwa = w_class.startswith("chrome-")
+            meta = {
+                "is_pwa": is_pwa,
+                "pwa_class": w_class if is_pwa else None
+            }
+
+        elif w_class_lower in ["foot", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty"]:
+            app_type = "terminal"
+            cwd, is_herdr = get_terminal_cwd_and_cmd(pid)
+            meta = {
+                "terminal_class": w_class_lower,
+                "cwd": cwd,
+                "is_herdr": is_herdr
+            }
+
+        elif w_class_lower in ["code", "vscodium", "cursor"]:
+            app_type = "vscode"
+            cmdline = get_process_cmdline(pid)
+            opened_dir = None
+            for arg in cmdline[1:]:
+                if os.path.isdir(arg):
+                    opened_dir = os.path.abspath(arg)
+                    break
+            meta = {
+                "opened_dir": opened_dir,
+                "cmdline": cmdline
+            }
+
+        else:
+            meta = {
+                "exe": exe,
+                "cmdline": get_process_cmdline(pid)
+            }
+
+        saved_windows.append({
+            "workspace_id": ws_id,
+            "workspace_name": ws.get("name", str(ws_id)),
+            "class": w_class,
+            "title": title,
+            "pid": pid,
+            "app_type": app_type,
+            "meta": meta,
+            "monitor": c.get("monitor", 0),
+            "floating": c.get("floating", False)
+        })
+
+    session_data = {
+        "timestamp": time.time(),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "has_chromium": has_chromium,
+        "chromium_bin": chromium_bin,
+        "window_count": len(saved_windows),
+        "windows": saved_windows
+    }
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2)
+
+    distinct_ws = len(set(w["workspace_id"] for w in saved_windows))
+    print(f"[omarchy-session] Saved {len(saved_windows)} window(s) across {distinct_ws} workspace(s).")
+    return True
+
+def restore_session():
+    if not SESSION_FILE.exists():
+        print("[omarchy-session] No saved session file found.")
+        return False
+
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            session = json.load(f)
+    except Exception as e:
+        print(f"[omarchy-session] Error reading session file: {e}", file=sys.stderr)
+        return False
+
+    windows = session.get("windows", [])
+    if not windows:
+        print("[omarchy-session] Saved session is empty.")
+        clear_session()
+        return False
+
+    cfg = load_config()
+    print(f"[omarchy-session] Restoring {len(windows)} application(s)...")
+
+    chromium_windows = [w for w in windows if w["app_type"] == "chromium"]
+    terminal_windows = [w for w in windows if w["app_type"] == "terminal"]
+    vscode_windows = [w for w in windows if w["app_type"] == "vscode"]
+    generic_windows = [w for w in windows if w["app_type"] == "generic"]
+
+    for cw in chromium_windows:
+        ws_id = cw["workspace_id"]
+        c_class = cw["class"]
+        safe_class = c_class.replace(".", "\\.").replace("-", "\\-")
+        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{safe_class}$" }}, workspace = "{ws_id} silent" }})')
+
+    launched_execs = set()
+    for gw in generic_windows:
+        ws_id = gw["workspace_id"]
+        c_class = gw["class"]
+        safe_class = c_class.replace(".", "\\.").replace("-", "\\-")
+        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{safe_class}$" }}, workspace = "{ws_id} silent" }})')
+
+    if session.get("has_chromium", False):
+        chrom_bin = session.get("chromium_bin") or "chromium"
+        print(f"[omarchy-session] Launching {chrom_bin} with --restore-last-session...")
+        subprocess.Popen(
+            [chrom_bin, "--restore-last-session"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+    term_idx = 0
+    for tw in terminal_windows:
+        term_idx += 1
+        ws_id = tw["workspace_id"]
+        meta = tw.get("meta", {})
+        cwd = meta.get("cwd", str(Path.home()))
+        is_herdr = meta.get("is_herdr", False)
+        term_class = meta.get("terminal_class", "foot")
+
+        custom_app_id = f"term_restore_{ws_id}_{term_idx}"
+        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^{custom_app_id}$" }}, workspace = "{ws_id} silent" }})')
+
+        launch_args = []
+        if "foot" in term_class:
+            launch_args = ["foot", f"-a={custom_app_id}", f"--working-directory={cwd}"]
+            if is_herdr:
+                launch_args.append("herdr")
+        elif "alacritty" in term_class:
+            launch_args = ["alacritty", "--class", custom_app_id, "--working-directory", cwd]
+            if is_herdr:
+                launch_args.extend(["-e", "herdr"])
+        elif "ghostty" in term_class:
+            launch_args = ["ghostty", f"--class={custom_app_id}", f"--working-directory={cwd}"]
+            if is_herdr:
+                launch_args.extend(["-e", "herdr"])
+        elif "kitty" in term_class:
+            launch_args = ["kitty", "--class", custom_app_id, "--directory", cwd]
+            if is_herdr:
+                launch_args.extend(["herdr"])
+        else:
+            launch_args = ["foot", f"-a={custom_app_id}", f"--working-directory={cwd}"]
+            if is_herdr:
+                launch_args.append("herdr")
+
+        subprocess.Popen(
+            launch_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        time.sleep(0.15)
+
+    for vw in vscode_windows:
+        ws_id = vw["workspace_id"]
+        meta = vw.get("meta", {})
+        opened_dir = meta.get("opened_dir")
+        hyprctl_eval(f'hl.window_rule({{ match = {{ class = "^[cC]ode$" }}, workspace = "{ws_id} silent" }})')
+        args = ["code"]
+        if opened_dir:
+            args.append(opened_dir)
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+    for gw in generic_windows:
+        meta = gw.get("meta", {})
+        exe = meta.get("exe")
+        if exe and os.path.exists(exe) and exe not in launched_execs:
+            launched_execs.add(exe)
+            subprocess.Popen(
+                [exe],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            time.sleep(0.1)
+
+    delay = cfg.get("clean_delay_sec", 7)
+    cleanup_cmd = f"sleep {delay} && hyprctl reload"
+    subprocess.Popen(["bash", "-c", cleanup_cmd], start_new_session=True)
+
+    try:
+        SESSION_FILE.replace(BACKUP_FILE)
+    except Exception:
+        pass
+
+    distinct_ws = len(set(w["workspace_id"] for w in windows))
+    run_cmd([
+        "notify-send",
+        "-a", "Omarchy Session",
+        "-i", "document-revert",
+        "Session Restored",
+        f"Reopened {len(windows)} app(s) across {distinct_ws} workspace(s)."
+    ])
+    return True
+
+def prompt_user():
+    if not SESSION_FILE.exists():
+        return
+
+    cfg = load_config()
+    if not cfg.get("enabled", True):
+        return
+
+    if cfg.get("auto_restore", False):
+        print("[omarchy-session] Auto-restore is enabled. Restoring without prompt...")
+        restore_session()
+        return
+
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            session = json.load(f)
+    except Exception:
+        return
+
+    win_count = session.get("window_count", 0)
+    windows = session.get("windows", [])
+    distinct_ws = len(set(w["workspace_id"] for w in windows))
+
+    prompt_text = "Restore Previous Session?"
+    opt_restore = f"✨ Reopen Windows & Workspaces\t{win_count} apps across {distinct_ws} workspace(s)"
+    opt_fresh = "❌ Start Fresh\tDiscard saved session"
+    opt_always = "⚙️ Always Reopen at Boot\tRestore automatically without asking"
+    opt_disable = "🚫 Disable Session Restore\tTurn off session saving and prompt"
+
+    try:
+        res = subprocess.run(
+            ["omarchy", "menu", "select", prompt_text, opt_restore, opt_fresh, opt_always, opt_disable],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        choice = res.stdout.strip()
+    except Exception as e:
+        print(f"[omarchy-session] Error opening menu: {e}", file=sys.stderr)
+        return
+
+    if not choice:
+        print("[omarchy-session] Prompt dismissed.")
+        return
+
+    if "Reopen Windows & Workspaces" in choice:
+        restore_session()
+    elif "Start Fresh" in choice:
+        clear_session()
+        run_cmd(["notify-send", "-a", "Omarchy Session", "Fresh Session", "Previous session discarded."])
+    elif "Always Reopen" in choice:
+        cfg["auto_restore"] = True
+        save_config(cfg)
+        run_cmd(["notify-send", "-a", "Omarchy Session", "Auto-Restore Enabled", "Future sessions will reopen automatically."])
+        restore_session()
+    elif "Disable Session Restore" in choice:
+        cfg["enabled"] = False
+        save_config(cfg)
+        clear_session()
+        run_cmd(["notify-send", "-a", "Omarchy Session", "Disabled", "Session restore has been disabled."])
+
+def clear_session():
+    if SESSION_FILE.exists():
+        try:
+            SESSION_FILE.unlink()
+            print("[omarchy-session] Cleared saved session.")
+        except Exception as e:
+            print(f"[omarchy-session] Error removing session file: {e}", file=sys.stderr)
+
+def status_session():
+    cfg = load_config()
+    print("=== Omarchy Session Restore Status ===")
+    print(f"Enabled: {cfg.get('enabled')}")
+    print(f"Auto-Restore at Boot: {cfg.get('auto_restore')}")
+    print(f"Session File: {SESSION_FILE}")
+    if SESSION_FILE.exists():
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"Saved At: {data.get('created_at')}")
+            print(f"Window Count: {data.get('window_count')}")
+            windows = data.get("windows", [])
+            for w in windows:
+                print(f"  • [WS {w['workspace_id']}] {w['class']} ({w['app_type']}) - {w['title'][:40]}")
+        except Exception as e:
+            print(f"Error reading session: {e}")
+    else:
+        print("No active saved session on disk.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Omarchy Session Restore CLI")
+    parser.add_argument("action", choices=["save", "restore", "prompt", "clear", "status"], help="Action to perform")
+    args = parser.parse_args()
+
+    if args.action == "save":
+        save_session()
+    elif args.action == "restore":
+        restore_session()
+    elif args.action == "prompt":
+        prompt_user()
+    elif args.action == "clear":
+        clear_session()
+    elif args.action == "status":
+        status_session()
+
+if __name__ == "__main__":
+    main()

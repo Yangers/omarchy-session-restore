@@ -1,0 +1,10 @@
+#!/bin/bash
+# Omarchy reboot wrapper: saves session state before closing apps and rebooting
+
+if command -v omarchy-session >/dev/null 2>&1; then
+    omarchy-session save
+elif [[ -x "$HOME/.local/bin/omarchy-session" ]]; then
+    "$HOME/.local/bin/omarchy-session" save
+fi
+
+exec /usr/share/omarchy/bin/omarchy-system-reboot "$@"

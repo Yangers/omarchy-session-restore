@@ -129,6 +129,33 @@ def get_terminal_cwd_and_cmd(pid):
 
     return best_cwd, is_herdr
 
+def report_herdr_agent_session(pane_id, agent, session_id):
+    sock_path = Path.home() / ".config" / "herdr" / "herdr.sock"
+    if not sock_path.exists():
+        return False
+    try:
+        import socket
+        seq = time.time_ns()
+        req = {
+            "id": f"omarchy-session:{seq}",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": f"herdr:{agent}",
+                "agent": agent,
+                "seq": seq,
+                "agent_session_id": session_id
+            }
+        }
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(str(sock_path))
+            s.sendall((json.dumps(req) + "\n").encode())
+            s.recv(4096)
+            return True
+    except Exception:
+        return False
+
 def save_session():
     cfg = load_config()
     if not cfg.get("enabled", True):
@@ -226,22 +253,75 @@ def save_session():
             "floating": c.get("floating", False)
         })
 
-    # Capture active Herdr agents if herdr is installed
+    # Capture active Herdr agents and sessions if herdr is installed
     herdr_agents = []
     if shutil.which("herdr"):
         try:
-            agent_raw = run_cmd(["herdr", "agent", "list"])
-            if agent_raw:
-                data = json.loads(agent_raw)
-                for a in data.get("result", {}).get("agents", []):
+            snap_raw = run_cmd(["herdr", "api", "snapshot"])
+            if snap_raw:
+                snap_data = json.loads(snap_raw).get("result", {}).get("snapshot", {})
+                agents_list = snap_data.get("agents", [])
+                
+                # Check presence locks for any agy processes
+                presence_dir = Path.home() / ".gemini" / "antigravity-cli" / "presence"
+                pid_to_cid = {}
+                if presence_dir.exists():
+                    try:
+                        lsof_out = run_cmd(["lsof", f"{presence_dir}/*.lock"], check=False)
+                        for line in lsof_out.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 9 and parts[1].isdigit() and parts[8].endswith(".lock"):
+                                pid_to_cid[int(parts[1])] = Path(parts[8]).stem
+                    except Exception:
+                        pass
+
+                for a in agents_list:
+                    p_id = a.get("pane_id")
+                    agent_name = a.get("agent")
+                    session_obj = a.get("agent_session")
+                    session_id = None
+                    if isinstance(session_obj, dict):
+                        session_id = session_obj.get("value")
+
+                    # If agy session_id not registered yet, resolve from presence and report to Herdr
+                    if not session_id and agent_name == "agy" and pid_to_cid:
+                        for agy_pid, cid in pid_to_cid.items():
+                            try:
+                                ppid = int(run_cmd(["ps", "-o", "ppid=", "-p", str(agy_pid)]).strip())
+                                gppid = int(run_cmd(["ps", "-o", "ppid=", "-p", str(ppid)]).strip())
+                                gcmd = run_cmd(["ps", "-o", "comm=", "-p", str(gppid)]).strip()
+                                if "herdr" in gcmd:
+                                    session_id = cid
+                                    report_herdr_agent_session(p_id, "agy", cid)
+                                    break
+                            except Exception:
+                                pass
+
                     herdr_agents.append({
-                        "agent": a.get("agent"),
-                        "pane_id": a.get("pane_id"),
+                        "agent": agent_name,
+                        "pane_id": p_id,
                         "cwd": a.get("cwd", str(Path.home())),
-                        "tab_id": a.get("tab_id")
+                        "tab_id": a.get("tab_id"),
+                        "workspace_id": a.get("workspace_id"),
+                        "session_id": session_id
                     })
         except Exception:
-            pass
+            # Fallback to simple agent list
+            try:
+                agent_raw = run_cmd(["herdr", "agent", "list"])
+                if agent_raw:
+                    data = json.loads(agent_raw)
+                    for a in data.get("result", {}).get("agents", []):
+                        herdr_agents.append({
+                            "agent": a.get("agent"),
+                            "pane_id": a.get("pane_id"),
+                            "cwd": a.get("cwd", str(Path.home())),
+                            "tab_id": a.get("tab_id"),
+                            "workspace_id": a.get("workspace_id"),
+                            "session_id": None
+                        })
+            except Exception:
+                pass
 
     session_data = {
         "timestamp": time.time(),
@@ -448,17 +528,66 @@ def restore_session():
     print("[omarchy-session] Reconciling window positions across workspaces...")
     reconcile_windows(windows, max_duration=10.0, poll_interval=0.3)
 
-    # Relaunch Herdr agents if saved
+    # Relaunch / reconcile Herdr agents if saved
     saved_herdr_agents = session.get("herdr_agents", [])
     if saved_herdr_agents and shutil.which("herdr"):
         def resume_herdr_agents():
-            time.sleep(3.0) # Wait for Herdr to finish connecting
+            sock_path = Path.home() / ".config" / "herdr" / "herdr.sock"
+            server_ready = False
+            for _ in range(30):
+                if sock_path.exists():
+                    try:
+                        st = run_cmd(["herdr", "status", "server", "--json"], check=False)
+                        if st and json.loads(st).get("running") is True:
+                            server_ready = True
+                            break
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+
+            if not server_ready:
+                print("[omarchy-session] Herdr server socket not ready after timeout; skipping agent fallback.")
+                return
+
+            # Give Herdr's native agent restore a moment to initialize restored panes
+            time.sleep(2.5)
+
+            active_agents = {}
+            try:
+                snap = run_cmd(["herdr", "api", "snapshot"], check=False)
+                if snap:
+                    s_data = json.loads(snap).get("result", {}).get("snapshot", {})
+                    for a in s_data.get("agents", []):
+                        active_agents[a.get("pane_id")] = a
+            except Exception:
+                pass
+
             for ha in saved_herdr_agents:
                 p_id = ha.get("pane_id")
                 agent_name = ha.get("agent")
-                if p_id and agent_name:
-                    print(f"[omarchy-session] Resuming agent {agent_name} in Herdr pane {p_id}...")
-                    run_cmd(["herdr", "pane", "run", p_id, agent_name])
+                session_id = ha.get("session_id")
+                if not p_id or not agent_name:
+                    continue
+
+                # Check if Herdr already resumed this pane natively
+                current = active_agents.get(p_id)
+                if current and current.get("agent") == agent_name and current.get("agent_status") in ("working", "idle", "blocked"):
+                    print(f"[omarchy-session] Herdr native restore active for {agent_name} in {p_id}.")
+                    continue
+
+                # Fallback: if native restore did not resume the agent, launch it with conversation ID
+                resume_cmd = agent_name
+                if agent_name == "agy" and session_id:
+                    resume_cmd = f"agy --conversation {session_id}"
+                elif agent_name == "claude" and session_id:
+                    resume_cmd = f"claude --resume {session_id}"
+                elif agent_name == "codex" and session_id:
+                    resume_cmd = f"codex resume {session_id}"
+                elif agent_name == "pi" and session_id:
+                    resume_cmd = f"pi --session {session_id}"
+
+                print(f"[omarchy-session] Fallback resuming agent in Herdr pane {p_id}: {resume_cmd}")
+                run_cmd(["herdr", "pane", "run", p_id, resume_cmd], check=False)
 
         threading.Thread(target=resume_herdr_agents, daemon=True).start()
 
@@ -568,7 +697,9 @@ def status_session():
             if agents:
                 print(f"Herdr Agents: {len(agents)}")
                 for a in agents:
-                    print(f"  🤖 Agent: {a.get('agent')} (pane: {a.get('pane_id')})")
+                    s_id = a.get("session_id")
+                    s_info = f", session: {s_id[:8]}..." if s_id else ""
+                    print(f"  🤖 Agent: {a.get('agent')} (pane: {a.get('pane_id')}{s_info})")
             windows = data.get("windows", [])
             for w in windows:
                 print(f"  • [WS {w['workspace_id']}] {w['class']} ({w['app_type']}) - {w['title'][:40]}")

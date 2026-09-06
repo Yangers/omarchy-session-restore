@@ -212,11 +212,25 @@ def save_session():
                 "pwa_class": w_class if is_pwa else None
             }
 
-        elif w_class_lower in ["foot", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty"]:
+        elif (
+            w_class_lower in ["foot", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty"]
+            or "term_restore" in w_class_lower
+            or any(t in w_class_lower for t in ["foot", "alacritty", "kitty", "ghostty"])
+            or (exe and any(t in Path(exe).name.lower() for t in ["foot", "alacritty", "kitty", "ghostty"]))
+        ):
             app_type = "terminal"
             cwd, is_herdr = get_terminal_cwd_and_cmd(pid)
+            if not is_herdr and ("herdr" in title.lower() or title.lower().startswith("omarchy:")):
+                is_herdr = True
+
+            real_term_class = "foot"
+            for t in ["alacritty", "kitty", "ghostty", "foot"]:
+                if t in w_class_lower or (exe and t in Path(exe).name.lower()):
+                    real_term_class = t
+                    break
+
             meta = {
-                "terminal_class": w_class_lower,
+                "terminal_class": real_term_class,
                 "cwd": cwd,
                 "is_herdr": is_herdr
             }
@@ -353,8 +367,10 @@ def reconcile_windows(expected_windows, max_duration=10.0, poll_interval=0.3):
             "target_ws": w["workspace_id"],
             "class": w.get("class", "").lower(),
             "initial_class": w.get("initial_class", "").lower(),
+            "custom_app_id": w.get("custom_app_id", "").lower(),
             "title": w.get("title", "").lower(),
-            "app_type": w.get("app_type", "generic")
+            "app_type": w.get("app_type", "generic"),
+            "is_herdr": w.get("meta", {}).get("is_herdr", False)
         })
 
     moved_addresses = set()
@@ -384,7 +400,11 @@ def reconcile_windows(expected_windows, max_duration=10.0, poll_interval=0.3):
                 target_ws = t["target_ws"]
                 matched = False
 
-                if t["class"] and (t["class"] == c_class or t["class"] == c_init_class):
+                if t.get("custom_app_id") and (t["custom_app_id"] in c_class or t["custom_app_id"] in c_init_class):
+                    matched = True
+                elif t.get("is_herdr") and ("herdr" in c_title or c_title.startswith("omarchy:")):
+                    matched = True
+                elif t["class"] and (t["class"] == c_class or t["class"] == c_init_class):
                     matched = True
                 elif t["app_type"] == "chromium" and t["title"] and len(t["title"]) > 3:
                     # Match key titles like Gmail, BBC, etc.
@@ -394,9 +414,8 @@ def reconcile_windows(expected_windows, max_duration=10.0, poll_interval=0.3):
 
                 if matched:
                     if current_ws != target_ws:
-                        move_cmd = f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{target_ws}", follow = false }})'
-                        run_cmd(["hyprctl", "dispatch", move_cmd])
-                        print(f"[omarchy-session] Reconciled {c.get('class')} -> Workspace {target_ws}")
+                        run_cmd(["hyprctl", "dispatch", "movetoworkspacesilent", f"{target_ws},address:{addr}"])
+                        print(f"[omarchy-session] Reconciled {c.get('class')} ({c.get('title')[:25]}) -> Workspace {target_ws}")
                     moved_addresses.add(addr)
                     break
 
@@ -462,11 +481,12 @@ def restore_session():
         term_class = meta.get("terminal_class", "foot")
 
         custom_app_id = f"term_restore_{ws_id}_{term_idx}"
-        hyprctl_eval(f'o.window("{custom_app_id}", {{ workspace = "{ws_id} silent" }})')
+        tw["custom_app_id"] = custom_app_id
+        hyprctl_eval(f'o.window("^{custom_app_id}$", {{ workspace = "{ws_id} silent" }})')
 
         launch_args = []
         if "foot" in term_class:
-            launch_args = ["foot", f"-a={custom_app_id}", f"--working-directory={cwd}"]
+            launch_args = ["foot", f"--app-id={custom_app_id}", f"--working-directory={cwd}"]
             if is_herdr:
                 launch_args.append("herdr")
         elif "alacritty" in term_class:
@@ -482,7 +502,7 @@ def restore_session():
             if is_herdr:
                 launch_args.extend(["herdr"])
         else:
-            launch_args = ["foot", f"-a={custom_app_id}", f"--working-directory={cwd}"]
+            launch_args = ["foot", f"--app-id={custom_app_id}", f"--working-directory={cwd}"]
             if is_herdr:
                 launch_args.append("herdr")
 
